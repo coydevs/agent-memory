@@ -8,6 +8,10 @@ binding = "DB"
 database_name = "agent-memory"
 database_id = "fbea37b7-469d-42d9-9fd8-c86d463e44bd"
 
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "agent-memory"
+
 [ai]
 binding = "AI"
 

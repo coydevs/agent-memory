@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 export interface Env {
   DB: D1Database;
   AI: Ai;
+  VECTORIZE: VectorizeIndex;
   API_KEY: string;
   ANTHROPIC_API_KEY: string;
 }
@@ -13,22 +14,9 @@ interface Memory {
   session_id: string | null;
   scope: string;
   content: string;
-  embedding: string | null;
   metadata: string;
   created_at: number;
   updated_at: number;
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
-  let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 function generateId(): string {
@@ -78,7 +66,6 @@ Agent: ${agentResponse}`;
 }
 
 async function extractMemoriesWithWorkersAI(env: Env, userMessage: string, agentResponse: string): Promise<Array<{content: string, scope: string, metadata: Record<string, unknown>}>> {
-  // Use llama with strict JSON prompt
   const result = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
     prompt: `<s>[INST] Extract factual memories from this conversation. Return ONLY a JSON array. No text before or after.
 
@@ -95,7 +82,6 @@ JSON array: [/INST]`,
   }) as { response: string };
 
   const text = '[' + (result.response?.trim() || ']');
-  // Find JSON array in response
   const match = text.match(/\[[\s\S]*?\]/);
   if (!match) return [];
   try {
@@ -106,11 +92,9 @@ JSON array: [/INST]`,
 }
 
 function heuristicExtract(userMessage: string, agentResponse: string): Array<{content: string, scope: string, metadata: Record<string, unknown>}> {
-  // Simple heuristic: look for preference/fact patterns
   const text = userMessage.trim();
   if (!text || text.length < 10) return [];
-  
-  // Patterns that indicate a factual statement worth remembering
+
   const prefPatterns = [
     /i prefer (.+)/i,
     /i (always|usually|typically) (.+)/i,
@@ -119,12 +103,11 @@ function heuristicExtract(userMessage: string, agentResponse: string): Array<{co
     /i('m| am) (.+)/i,
     /i (work|live|study) (.+)/i,
   ];
-  
+
   const memories: Array<{content: string, scope: string, metadata: Record<string, unknown>}> = [];
-  
+
   for (const pattern of prefPatterns) {
     if (pattern.test(text) && memories.length < 3) {
-      // Create a normalized memory from the user statement
       const sentence = text.split(/[.!?]/)[0].trim();
       if (sentence.length > 5) {
         memories.push({ content: sentence, scope: 'long_term', metadata: { source: 'heuristic' } });
@@ -132,12 +115,11 @@ function heuristicExtract(userMessage: string, agentResponse: string): Array<{co
       }
     }
   }
-  
+
   return memories;
 }
 
 async function extractMemories(env: Env, userMessage: string, agentResponse: string): Promise<{memories: Array<{content: string, scope: string, metadata: Record<string, unknown>}>, debug?: string}> {
-  // Try Anthropic first
   try {
     const memories = await extractMemoriesWithAnthropic(env, userMessage, agentResponse);
     if (memories.length > 0) return { memories };
@@ -145,7 +127,6 @@ async function extractMemories(env: Env, userMessage: string, agentResponse: str
     console.warn('Anthropic extraction failed:', anthropicErr);
   }
 
-  // Try Workers AI
   try {
     const memories = await extractMemoriesWithWorkersAI(env, userMessage, agentResponse);
     if (memories.length > 0) return { memories, debug: 'used_workers_ai' };
@@ -153,7 +134,6 @@ async function extractMemories(env: Env, userMessage: string, agentResponse: str
     console.warn('Workers AI extraction failed:', aiErr);
   }
 
-  // Heuristic fallback
   const memories = heuristicExtract(userMessage, agentResponse);
   return { memories, debug: memories.length > 0 ? 'used_heuristic' : 'nothing_extracted' };
 }
@@ -189,19 +169,24 @@ app.post('/store', async (c) => {
 
   const id = generateId();
   const now = Date.now();
-  let embeddingJson: string | null = null;
 
+  // Store in D1 (source of truth)
+  await c.env.DB.prepare(
+    `INSERT INTO memories (id, user_id, session_id, scope, content, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, user_id, session_id || null, scope, content, JSON.stringify(metadata), now, now).run();
+
+  // Embed and upsert to Vectorize
   try {
     const embedding = await getEmbedding(c.env, content);
-    embeddingJson = JSON.stringify(embedding);
+    await c.env.VECTORIZE.upsert([{
+      id,
+      values: embedding,
+      metadata: { user_id, content, scope, session_id: session_id || '' },
+    }]);
   } catch (e) {
-    console.error('Embedding failed:', e);
+    console.error('Vectorize upsert failed:', e);
   }
-
-  await c.env.DB.prepare(
-    `INSERT INTO memories (id, user_id, session_id, scope, content, embedding, metadata, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(id, user_id, session_id || null, scope, content, embeddingJson, JSON.stringify(metadata), now, now).run();
 
   return c.json({ stored: true, id, content, scope });
 });
@@ -216,41 +201,40 @@ app.post('/recall', async (c) => {
 
   if (!query) return c.json({ error: 'query is required' }, 400);
 
-  // Get embedding for query
+  // Embed the query
   const queryEmbedding = await getEmbedding(c.env, query);
 
-  // Get all memories for this user that have embeddings
-  const rows = await c.env.DB.prepare(
-    'SELECT * FROM memories WHERE user_id = ? AND embedding IS NOT NULL ORDER BY created_at DESC LIMIT 500'
-  ).bind(user_id).all<Memory>();
+  // Query Vectorize with user_id filter
+  const vectorResults = await c.env.VECTORIZE.query(queryEmbedding, {
+    topK: limit,
+    filter: { user_id },
+    returnMetadata: 'none',
+  });
 
-  if (!rows.results?.length) {
+  if (!vectorResults.matches?.length) {
     return c.json({ memories: [] });
   }
 
-  // Compute cosine similarity and rank
-  const scored = rows.results
-    .map(m => {
-      try {
-        const emb = JSON.parse(m.embedding!) as number[];
-        const score = cosineSimilarity(queryEmbedding, emb);
-        return { ...m, score };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean)
-    .sort((a, b) => (b!.score - a!.score))
-    .slice(0, limit);
+  // Fetch full records from D1 by IDs
+  const ids = vectorResults.matches.map(m => m.id);
+  const placeholders = ids.map(() => '?').join(', ');
+  const rows = await c.env.DB.prepare(
+    `SELECT id, user_id, session_id, scope, content, metadata, created_at, updated_at FROM memories WHERE id IN (${placeholders})`
+  ).bind(...ids).all<Memory>();
 
-  const memories = scored.map(m => ({
-    id: m!.id,
-    content: m!.content,
-    scope: m!.scope,
-    metadata: JSON.parse(m!.metadata || '{}'),
-    score: m!.score,
-    created_at: m!.created_at,
-  }));
+  // Build a score map from Vectorize results
+  const scoreMap = new Map(vectorResults.matches.map(m => [m.id, m.score]));
+
+  const memories = (rows.results || [])
+    .map(m => ({
+      id: m.id,
+      content: m.content,
+      scope: m.scope,
+      metadata: JSON.parse(m.metadata || '{}'),
+      score: scoreMap.get(m.id) ?? 0,
+      created_at: m.created_at,
+    }))
+    .sort((a, b) => b.score - a.score);
 
   return c.json({ memories });
 });
@@ -282,29 +266,38 @@ app.post('/capture', async (c) => {
     if (!mem.content?.trim()) continue;
 
     const id = generateId();
-    let embeddingJson: string | null = null;
 
-    try {
-      const embedding = await getEmbedding(c.env, mem.content);
-      embeddingJson = JSON.stringify(embedding);
-    } catch (e) {
-      console.error('Embedding failed:', e);
-    }
-
+    // Store in D1 (source of truth)
     await c.env.DB.prepare(
-      `INSERT INTO memories (id, user_id, session_id, scope, content, embedding, metadata, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (id, user_id, session_id, scope, content, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       id,
       user_id,
       session_id || null,
       mem.scope || 'long_term',
       mem.content,
-      embeddingJson,
       JSON.stringify(mem.metadata || {}),
       now,
       now,
     ).run();
+
+    // Embed and upsert to Vectorize
+    try {
+      const embedding = await getEmbedding(c.env, mem.content);
+      await c.env.VECTORIZE.upsert([{
+        id,
+        values: embedding,
+        metadata: {
+          user_id,
+          content: mem.content,
+          scope: mem.scope || 'long_term',
+          session_id: session_id || '',
+        },
+      }]);
+    } catch (e) {
+      console.error('Vectorize upsert failed for memory:', id, e);
+    }
 
     savedMemories.push({ id, content: mem.content, scope: mem.scope || 'long_term', metadata: mem.metadata || {} });
   }
@@ -312,10 +305,52 @@ app.post('/capture', async (c) => {
   return c.json({ captured: savedMemories.length, memories: savedMemories });
 });
 
+// POST /reindex — re-upsert all D1 memories to Vectorize (admin, one-time migration)
+app.post('/reindex', async (c) => {
+  const rows = await c.env.DB.prepare(
+    'SELECT id, user_id, session_id, scope, content, metadata FROM memories ORDER BY created_at ASC'
+  ).all<Memory>();
+
+  let upserted = 0;
+  let failed = 0;
+
+  for (const m of rows.results || []) {
+    try {
+      const embedding = await getEmbedding(c.env, m.content);
+      await c.env.VECTORIZE.upsert([{
+        id: m.id,
+        values: embedding,
+        metadata: {
+          user_id: m.user_id,
+          content: m.content,
+          scope: m.scope,
+          session_id: m.session_id || '',
+        },
+      }]);
+      upserted++;
+    } catch (e) {
+      console.error('Reindex failed for', m.id, e);
+      failed++;
+    }
+  }
+
+  return c.json({ reindexed: upserted, failed, total: rows.results?.length ?? 0 });
+});
+
 // DELETE /memory/:id
 app.delete('/memory/:id', async (c) => {
   const id = c.req.param('id');
+
+  // Delete from D1
   await c.env.DB.prepare('DELETE FROM memories WHERE id = ?').bind(id).run();
+
+  // Delete from Vectorize
+  try {
+    await c.env.VECTORIZE.deleteByIds([id]);
+  } catch (e) {
+    console.error('Vectorize delete failed:', e);
+  }
+
   return c.json({ deleted: true });
 });
 
@@ -336,7 +371,7 @@ app.get('/memories', async (c) => {
   sql += ' ORDER BY created_at DESC LIMIT ?';
   params.push(limit);
 
-  const rows = await c.env.DB.prepare(sql).bind(...params).all<Omit<Memory, 'embedding'>>();
+  const rows = await c.env.DB.prepare(sql).bind(...params).all<Memory>();
 
   const memories = (rows.results || []).map(m => ({
     ...m,
