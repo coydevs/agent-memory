@@ -1,0 +1,23 @@
+{
+  "name": "agent-memory",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260305.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.70.0"
+  },
+  "dependencies": {
+    "hono": "^4.12.5"
+  }
+}
