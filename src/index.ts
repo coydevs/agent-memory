@@ -6,6 +6,7 @@ export interface Env {
   VECTORIZE: VectorizeIndex;
   API_KEY: string;
   ANTHROPIC_API_KEY: string;
+  OPENAI_API_KEY: string;
 }
 
 interface Memory {
@@ -29,8 +30,20 @@ function generateId(): string {
 }
 
 async function getEmbedding(env: Env, text: string): Promise<number[]> {
-  const result = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [text] }) as { data: number[][] };
-  return result.data[0];
+  const res = await fetch('https://api.openai.com/v1/embeddings', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'text-embedding-3-small',
+      input: text,
+    }),
+  });
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(`OpenAI embedding error ${res.status}: ${JSON.stringify(data)}`);
+  return data.data[0].embedding;
 }
 
 // ─── Deduplication-aware store helper ───────────────────────────────────────
@@ -129,45 +142,42 @@ Agent: ${agentResponse}`;
   return JSON.parse(clean);
 }
 
-// New: extract from messages[] array using Workers AI llama-3.1-8b-instruct
+// New: extract from messages[] array using OpenAI gpt-4o-mini
 async function extractMemoriesFromMessages(
   env: Env,
   messages: Array<{role: string; content: string}>
 ): Promise<string[]> {
-  const conversationText = messages
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-    .join('\n');
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `Extract 0-5 durable facts from this conversation that are worth remembering long-term. Focus on: explicit preferences, project decisions, important facts about tools/systems, lessons learned. Return ONLY a JSON object with a "facts" key containing an array of strings. Empty array if nothing worth storing.`,
+        },
+        {
+          role: 'user',
+          content: JSON.stringify(messages),
+        },
+      ],
+      max_tokens: 500,
+      response_format: { type: 'json_object' },
+    }),
+  });
 
-  const systemPrompt = `Extract 0-5 durable facts worth remembering from this conversation. Focus on:
-- Technical decisions made (architecture, tools chosen, configs)
-- Preferences expressed (likes, dislikes, ways of working)
-- Project facts (credentials, URLs, names, relationships)
-- Problems solved and their root causes
-
-Return ONLY a JSON array of strings. Each string is one memory, written as a clear declarative fact. If nothing is worth remembering, return [].`;
-
-  const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: `Conversation:\n${conversationText}` },
-    ],
-    max_tokens: 512,
-  }) as { response: string };
-
-  const raw = result.response?.trim() || '[]';
-
-  // Strip markdown code fences if present
-  const clean = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-
-  // Find the JSON array
-  const match = clean.match(/\[[\s\S]*\]/);
-  if (!match) return [];
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(`OpenAI chat error ${res.status}: ${JSON.stringify(data)}`);
 
   try {
-    const parsed = JSON.parse(match[0]);
-    if (Array.isArray(parsed)) {
-      // Accept both string[] and {content:string}[] for flexibility
-      return parsed
+    const parsed = JSON.parse(data.choices[0].message.content);
+    const facts = parsed.facts || parsed.memories || parsed.items || [];
+    if (Array.isArray(facts)) {
+      return facts
         .map((item: unknown) =>
           typeof item === 'string' ? item : (item as { content?: string }).content || ''
         )
