@@ -20,6 +20,27 @@ interface Memory {
   updated_at: number;
 }
 
+interface Entity {
+  id: string;
+  user_id: string;
+  name: string;
+  type: string;
+  description: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface Relationship {
+  id: string;
+  user_id: string;
+  from_entity_id: string;
+  to_entity_id: string;
+  relation: string;
+  context: string | null;
+  memory_id: string | null;
+  created_at: number;
+}
+
 function generateId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
@@ -47,7 +68,6 @@ async function getEmbedding(env: Env, text: string): Promise<number[]> {
 }
 
 // ─── Deduplication-aware store helper ───────────────────────────────────────
-// Returns {duplicate:true, existing_id} or {stored:true, id}
 async function storeMemoryWithDedup(
   env: Env,
   opts: {
@@ -63,10 +83,8 @@ async function storeMemoryWithDedup(
 > {
   const { content, user_id, session_id, scope = 'long_term', metadata = {} } = opts;
 
-  // 1. Embed
   const embedding = await getEmbedding(env, content);
 
-  // 2. Check for semantic duplicate (top-1, same user)
   try {
     const dupCheck = await env.VECTORIZE.query(embedding, {
       topK: 1,
@@ -83,7 +101,6 @@ async function storeMemoryWithDedup(
     console.warn('Dedup check failed, proceeding with insert:', e);
   }
 
-  // 3. Not a duplicate — insert
   const id = generateId();
   const now = Date.now();
 
@@ -103,6 +120,164 @@ async function storeMemoryWithDedup(
   }
 
   return { stored: true, id, content, scope };
+}
+
+// ─── Graph extraction ────────────────────────────────────────────────────────
+
+interface GraphExtractionResult {
+  entities: Array<{ name: string; type: string; description: string }>;
+  relationships: Array<{ from: string; to: string; relation: string; context: string }>;
+}
+
+async function extractGraphEntities(
+  env: Env,
+  text: string
+): Promise<GraphExtractionResult> {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `Extract named entities and relationships from this conversation exchange. Return JSON only: { "entities": [{"name": string, "type": "person|project|technology|concept|error|decision", "description": string}], "relationships": [{"from": string, "to": string, "relation": "uses|causes|fixes|owns|part_of|related_to|decided|learned", "context": string}] }`,
+        },
+        {
+          role: 'user',
+          content: text,
+        },
+      ],
+      max_tokens: 800,
+      response_format: { type: 'json_object' },
+    }),
+  });
+
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(`OpenAI graph extraction error ${res.status}: ${JSON.stringify(data)}`);
+
+  const parsed = JSON.parse(data.choices[0].message.content);
+  return {
+    entities: Array.isArray(parsed.entities) ? parsed.entities : [],
+    relationships: Array.isArray(parsed.relationships) ? parsed.relationships : [],
+  };
+}
+
+async function upsertGraphData(
+  env: Env,
+  user_id: string,
+  memory_id: string,
+  graphData: GraphExtractionResult
+): Promise<void> {
+  const now = Date.now();
+
+  // Build entity name → id map (upsert entities)
+  const entityNameToId = new Map<string, string>();
+
+  for (const entity of graphData.entities) {
+    if (!entity.name?.trim()) continue;
+
+    // Check if entity already exists for this user
+    const existing = await env.DB.prepare(
+      'SELECT id FROM entities WHERE user_id = ? AND name = ? COLLATE NOCASE LIMIT 1'
+    ).bind(user_id, entity.name).first<{ id: string }>();
+
+    if (existing) {
+      // Update description if provided
+      if (entity.description) {
+        await env.DB.prepare(
+          'UPDATE entities SET description = ?, updated_at = ? WHERE id = ?'
+        ).bind(entity.description, now, existing.id).run();
+      }
+      entityNameToId.set(entity.name.toLowerCase(), existing.id);
+    } else {
+      const id = generateId();
+      await env.DB.prepare(
+        'INSERT INTO entities (id, user_id, name, type, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(id, user_id, entity.name, entity.type || 'concept', entity.description || null, now, now).run();
+      entityNameToId.set(entity.name.toLowerCase(), id);
+    }
+  }
+
+  // Insert relationships
+  for (const rel of graphData.relationships) {
+    if (!rel.from?.trim() || !rel.to?.trim()) continue;
+
+    const fromId = entityNameToId.get(rel.from.toLowerCase());
+    const toId = entityNameToId.get(rel.to.toLowerCase());
+
+    if (!fromId || !toId) continue; // Skip if we couldn't resolve entities
+
+    const id = generateId();
+    await env.DB.prepare(
+      'INSERT INTO relationships (id, user_id, from_entity_id, to_entity_id, relation, context, memory_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(id, user_id, fromId, toId, rel.relation || 'related_to', rel.context || null, memory_id, now).run();
+  }
+}
+
+// ─── Graph enrichment for recall ─────────────────────────────────────────────
+
+async function enrichRecallWithGraph(
+  env: Env,
+  user_id: string,
+  memories: Array<{ content: string }>
+): Promise<{ entities: Entity[]; relationships: Relationship[] }> {
+  // Extract potential entity names from top 3 memories by looking for entities
+  const topMemories = memories.slice(0, 3);
+  const allContent = topMemories.map(m => m.content).join(' ');
+
+  // Get all entities for user (we'll filter by content mention)
+  const allEntities = await env.DB.prepare(
+    'SELECT id, user_id, name, type, description, created_at, updated_at FROM entities WHERE user_id = ?'
+  ).bind(user_id).all<Entity>();
+
+  const entities = allEntities.results || [];
+
+  // Find entities mentioned in the memory content
+  const mentionedEntityIds = new Set<string>();
+  for (const entity of entities) {
+    if (allContent.toLowerCase().includes(entity.name.toLowerCase())) {
+      mentionedEntityIds.add(entity.id);
+    }
+  }
+
+  if (mentionedEntityIds.size === 0) {
+    return { entities: [], relationships: [] };
+  }
+
+  // Get 1-hop relationships for mentioned entities
+  const idList = Array.from(mentionedEntityIds);
+  const placeholders = idList.map(() => '?').join(', ');
+
+  const rels = await env.DB.prepare(
+    `SELECT id, user_id, from_entity_id, to_entity_id, relation, context, memory_id, created_at
+     FROM relationships
+     WHERE user_id = ? AND (from_entity_id IN (${placeholders}) OR to_entity_id IN (${placeholders}))`
+  ).bind(user_id, ...idList, ...idList).all<Relationship>();
+
+  const relationships = rels.results || [];
+
+  // Collect all entity IDs referenced by those relationships
+  const allEntityIds = new Set<string>(mentionedEntityIds);
+  for (const rel of relationships) {
+    allEntityIds.add(rel.from_entity_id);
+    allEntityIds.add(rel.to_entity_id);
+  }
+
+  // Fetch all relevant entities
+  const relEntityIds = Array.from(allEntityIds);
+  const relPlaceholders = relEntityIds.map(() => '?').join(', ');
+  const relEntities = await env.DB.prepare(
+    `SELECT id, user_id, name, type, description, created_at, updated_at FROM entities WHERE id IN (${relPlaceholders})`
+  ).bind(...relEntityIds).all<Entity>();
+
+  return {
+    entities: relEntities.results || [],
+    relationships,
+  };
 }
 
 // ─── AI extraction helpers ───────────────────────────────────────────────────
@@ -142,7 +317,6 @@ Agent: ${agentResponse}`;
   return JSON.parse(clean);
 }
 
-// New: extract from messages[] array using OpenAI gpt-4o-mini
 async function extractMemoriesFromMessages(
   env: Env,
   messages: Array<{role: string; content: string}>
@@ -313,7 +487,7 @@ app.post('/recall', async (c) => {
   });
 
   if (!vectorResults.matches?.length) {
-    return c.json({ memories: [] });
+    return c.json({ memories: [], graph: { entities: [], relationships: [] } });
   }
 
   const ids = vectorResults.matches.map(m => m.id);
@@ -335,7 +509,15 @@ app.post('/recall', async (c) => {
     }))
     .sort((a, b) => b.score - a.score);
 
-  return c.json({ memories });
+  // Graph enrichment (graceful degradation)
+  let graph: { entities: Entity[]; relationships: Relationship[] } = { entities: [], relationships: [] };
+  try {
+    graph = await enrichRecallWithGraph(c.env, user_id, memories);
+  } catch (e) {
+    console.error('Graph enrichment failed (non-fatal):', e);
+  }
+
+  return c.json({ memories, graph });
 });
 
 // POST /recall-and-inject — recall + format as system prompt prefix
@@ -426,6 +608,7 @@ app.post('/capture', async (c) => {
     let stored = 0;
     let duplicates = 0;
     const storedMemories: string[] = [];
+    const storedMemoryIds: string[] = [];
 
     for (const content of memoryStrings) {
       if (!content.trim()) continue;
@@ -441,6 +624,19 @@ app.post('/capture', async (c) => {
       } else {
         stored++;
         storedMemories.push(content);
+        storedMemoryIds.push(result.id);
+      }
+    }
+
+    // Graph extraction (awaited — adds small latency but ensures it completes)
+    if (storedMemoryIds.length > 0) {
+      const conversationText = body.messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      const representativeMemoryId = storedMemoryIds[0];
+      try {
+        const graphData = await extractGraphEntities(c.env, conversationText);
+        await upsertGraphData(c.env, user_id, representativeMemoryId, graphData);
+      } catch (e) {
+        console.error('Graph extraction failed (non-fatal):', e);
       }
     }
 
@@ -464,7 +660,7 @@ app.post('/capture', async (c) => {
     return c.json({ captured: 0, memories: [], debug: extractDebug });
   }
 
-  const savedMemories = [];
+  const savedMemories: Array<{ id: string; content: string; scope: string; metadata: Record<string, unknown> }> = [];
   for (const mem of extracted) {
     if (!mem.content?.trim()) continue;
 
@@ -478,6 +674,18 @@ app.post('/capture', async (c) => {
 
     if (!('duplicate' in result)) {
       savedMemories.push({ id: result.id, content: result.content, scope: result.scope, metadata: mem.metadata || {} });
+    }
+  }
+
+  // Graph extraction (awaited — ensures it completes before response)
+  if (savedMemories.length > 0) {
+    const conversationText = `User: ${user_message}\nAgent: ${agent_response}`;
+    const representativeMemoryId = savedMemories[0].id;
+    try {
+      const graphData = await extractGraphEntities(c.env, conversationText);
+      await upsertGraphData(c.env, user_id, representativeMemoryId, graphData);
+    } catch (e) {
+      console.error('Graph extraction failed (non-fatal):', e);
     }
   }
 
@@ -556,6 +764,32 @@ app.get('/memories', async (c) => {
   }));
 
   return c.json({ memories, total: memories.length });
+});
+
+// GET /graph — returns all entities + relationships for a user (visualization)
+app.get('/graph', async (c) => {
+  const user_id = c.req.query('user_id') || 'default';
+
+  const entitiesResult = await c.env.DB.prepare(
+    'SELECT id, user_id, name, type, description, created_at, updated_at FROM entities WHERE user_id = ? ORDER BY name ASC'
+  ).bind(user_id).all<Entity>();
+
+  const entities = entitiesResult.results || [];
+
+  const relationshipsResult = await c.env.DB.prepare(
+    'SELECT id, user_id, from_entity_id, to_entity_id, relation, context, memory_id, created_at FROM relationships WHERE user_id = ? ORDER BY created_at DESC'
+  ).bind(user_id).all<Relationship>();
+
+  const relationships = relationshipsResult.results || [];
+
+  return c.json({
+    entities,
+    relationships,
+    stats: {
+      entity_count: entities.length,
+      relationship_count: relationships.length,
+    },
+  });
 });
 
 export default app;
